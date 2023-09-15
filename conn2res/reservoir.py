@@ -7,7 +7,6 @@ import numpy as np
 from numpy.linalg import pinv
 from . import utils
 
-
 class Reservoir(metaclass=ABCMeta):
     """
     Class that represents a general Reservoir object
@@ -90,8 +89,14 @@ class EchoStateNetwork(Reservoir):
         reservoir activation states
     n_nodes : int
         dimension of the reservoir
-    activation_function : {'tanh', 'piecewise'}
+    activation_function : fct
         type of activation function
+    activation_function_derivative : fct
+        derivative of activation function
+    LE : numpy.ndarray
+        Lyapunov exponents of the reservoir
+    LE_trajectory : numpy.ndarray
+        Lyapunov exponents of the reservoir over time
 
     Methods
     -------
@@ -122,11 +127,13 @@ class EchoStateNetwork(Reservoir):
 
         # activation function
         self.activation_function = self.set_activation_function(
-            activation_function)
+            activation_function, **kwargs)
+        self.activation_function_derivative = self.get_derivative(
+            activation_function, **kwargs)
 
     def simulate(
         self, ext_input, w_in, input_gain=None, ic=None, output_nodes=None,
-        return_states=True, **kwargs
+        return_states=True, compute_LE = False, **kwargs
     ):
         """
         Simulates reservoir dynamics given an external input signal
@@ -152,6 +159,8 @@ class EchoStateNetwork(Reservoir):
             'return_states' is True.
         return_states : bool, optional
             If True, simulated resrvoir states are returned. True by default.
+        compute_LE : bool, optional
+            If True, compute the Lyapunov spectrum of the reservoir. False by default.
         kwargs:
             Other keyword arguments are passed to self.activation_function
 
@@ -184,6 +193,12 @@ class EchoStateNetwork(Reservoir):
         if input_gain is not None:
             w_in = input_gain * w_in
 
+        if compute_LE and self.activation_function_derivative is not None:
+            warmup = kwargs.get('warmup', 10)
+            Q = np.eye(self.n_nodes)
+            y = np.zeros(self.n_nodes)
+            self.LE_trajectory = np.zeros((len(timesteps), self.n_nodes))
+
         # simulate dynamics
         for t in timesteps:
             # if (t > 0) and (t % 100 == 0):
@@ -191,6 +206,18 @@ class EchoStateNetwork(Reservoir):
             synap_input = np.dot(
                 self._state[t-1, :], self.w) + np.dot(ext_input[t-1, :], w_in)
             self._state[t, :] = self.activation_function(synap_input, **kwargs)
+
+            if compute_LE and self.activation_function_derivative is not None:
+                J = np.dot(self.w, np.diag(self.activation_function_derivative(synap_input)))
+                Q = np.dot(J, Q)
+                Q, R = np.linalg.qr(Q)
+                yt = np.log(np.abs(np.diag(R)))
+                self.LE_trajectory[t-1, :] = yt
+                if t > warmup:
+                    y += yt
+        
+        if compute_LE and self.activation_function_derivative is not None:
+            self.LE = y / (timesteps[-1] - warmup)
 
         # remove initial condition (to match the time index of _state
         # and ext_input)
@@ -210,19 +237,22 @@ class EchoStateNetwork(Reservoir):
             else:
                 return self._state
 
-    def set_activation_function(self, function):
+    def set_activation_function(self, function, **kwargs):
 
-        def linear(x, m=1):
+        def linear(x, **kwargs):
+            m = kwargs.get('m', 1)
             return m * x
 
-        def elu(x, alpha=0.5):
+        def elu(x, **kwargs):
+            alpha = kwargs.get('alpha', 0.5)
             x[x <= 0] = alpha*(np.exp(x[x <= 0]) - 1)
             return x
 
         def relu(x):
             return np.maximum(0, x)
 
-        def leaky_relu(x, alpha=0.5):
+        def leaky_relu(x, **kwargs):
+            alpha = kwargs.get('alpha', 0.5)
             return np.maximum(alpha * x, x)
 
         def sigmoid(x):
@@ -231,7 +261,10 @@ class EchoStateNetwork(Reservoir):
         def tanh(x):
             return np.tanh(x)
 
-        def step(x, thr=0.5, vmin=0, vmax=1):
+        def step(x, **kwargs):
+            thr = kwargs.get('thr', 0.5)
+            vmin = kwargs.get('vmin', 0)
+            vmax = kwargs.get('vmax', 1)
             return np.piecewise(x, [x < thr, x >= thr], [vmin, vmax]).astype(int)
 
         if function == 'linear':
@@ -248,7 +281,492 @@ class EchoStateNetwork(Reservoir):
             return tanh
         elif function == 'step':
             return step
+        
+    def get_derivative(self, function, **kwargs):
 
+        def linear_derivative(x, **kwargs):
+            m = kwargs.get('m', 1)
+            return m
+
+        def elu_derivative(x, **kwargs):
+            alpha = kwargs.get('alpha', 0.5)
+            return np.piecewise(x, [x <= 0, x > 0], [alpha * np.exp(x), 1])
+
+        def relu_derivative(x):
+            return np.piecewise(x, [x <= 0, x > 0], [0, 1])
+
+        def leaky_relu_derivative(x, **kwargs):
+            alpha = kwargs.get('alpha', 0.5)
+            return np.piecewise(x, [x <= 0, x > 0], [alpha, 1])
+
+        def sigmoid_derivative(x):
+            return (self.activation_function(x) * 
+                    (1 - self.activation_function(x)))
+
+        def tanh_derivative(x):
+            return 1 - np.tanh(x)**2
+
+        if function == 'linear':
+            return linear_derivative
+        elif function == 'elu':
+            return elu_derivative
+        elif function == 'relu':
+            return relu_derivative
+        elif function == 'leaky_relu':
+            return leaky_relu_derivative
+        elif function == 'sigmoid':
+            return sigmoid_derivative
+        elif function == 'tanh':
+            return tanh_derivative
+        elif function == 'step':
+            return None
+
+class SpikingNeuralNetwork(Reservoir):
+    """
+    Class that represents a Spiking Neural Network
+    Adapted from Kim et al., 2019 and Nicola & Clopath, 2017
+    (https://github.com/rkim35/spikeRNN/blob/master/spiking/LIF_network_fnc.m)
+    ...
+
+    Attributes
+    ----------
+    w : (N, N) numpy.ndarray
+        reservoir connectivity matrix (source, target)
+        N: number of nodes in the network. If w is directed, then rows
+        (columns) should correspond to source (target) nodes.
+    _state : same as ext_input
+        reservoir activation states
+    n_nodes : int
+        dimension of the reservoir
+    inh : (N,) numpy.ndarray
+        boolean array indicating whether a node is 
+        inhibitory (True) or excitatory (False)
+        N: number of nodes in the network
+    exc : (N,) numpy.ndarray
+        boolean array indicating whether a node is
+        excitatory (True) or inhibitory (False)
+        N: number of nodes in the network
+    dt : float
+        sampling rate (in s)
+    T : float
+        trial duration (in s)
+    nt : int
+        number of time steps
+    td : float or numpy.ndarray
+        decay time constants of the synaptic filter model (in s)
+    REC : (nt, N) numpy.ndarray
+        membrane voltage tracings (mV)
+        nt: number of time steps
+        N: number of nodes in the network
+    Is : (N, nt) numpy.ndarray
+        external input current
+        nt: number of time steps
+        N: number of nodes in the network
+    IPSCs : (N, nt) numpy.ndarray
+        post synaptic currents over time
+        nt: number of time steps
+        N: number of nodes in the network
+    spk : (N, nt) numpy.ndarray
+        spike raster
+        nt: number of time steps
+        N: number of nodes in the network
+    rs : (N, nt/timescale) numpy.ndarray
+        filtered firing rates over time
+        nt: number of time steps
+        N: number of nodes in the network
+        timescale: number of internal time steps per external time steps
+    hs : (N, nt) numpy.ndarray
+        filtered firing rates over time (synaptic input accumulation)
+        nt: number of time steps
+        N: number of nodes in the network
+    tspike : (N_spikes, 2) numpy.ndarray
+        spike times (in s)
+        N_spikes: number of spikes
+        tspike[:, 0]: spike neuronal indices
+        tspike[:, 1]: spike times (in s)
+    inh_fr : (N_inh,) numpy.ndarray
+        average firing rates of inhibitory neurons
+        N_inh: number of inhibitory neurons
+    exc_fr : (N_exc,) numpy.ndarray
+        average firing rates of excitatory neurons
+        N_exc: number of excitatory neurons
+    all_fr : (N,) numpy.ndarray
+        average firing rates of all neurons
+        N: number of neurons in the network
+
+    Methods
+    -------
+    # TODO
+
+    simulate
+
+    """
+
+    def __init__(self, *args, inh = 0.2, **kwargs):
+        """
+        Constructor class for Spiking Neural Networks
+
+        Parameters
+        ----------
+        w: (N, N) numpy.ndarray
+            Reservoir connectivity matrix (source, target)
+            N: number of nodes in the network. If w is directed, 
+            then rows (columns) should correspond to source (target) nodes.
+        inh: float or (N,) numpy.ndarray, optional
+            If float, inh should be in the range [0, 1] and
+            indicates the proportion of inhibitory neurons in the network.
+            If numpy.ndarray of shape (N,), then inh is a
+            boolean array indicating whether a node is 
+            inhibitory (True) or excitatory (False)
+            Default: 0.2
+        """
+
+        super().__init__(*args, **kwargs)
+
+        if not(isinstance(inh, (float, np.ndarray))):
+            raise TypeError('inh must be float or numpy.ndarray')
+
+        if isinstance(inh, np.ndarray):
+            if not np.issubdtype(inh.dtype, np.bool_):
+                raise TypeError('inh must be boolean')
+            exc = ~inh
+        else:
+            if not (0 <= inh <= 1):
+                raise ValueError('inh and exc must be in the range [0, 1]')
+            inh = np.random.rand(self.n_nodes) < inh
+            exc = ~inh
+
+        self.inh = inh
+        self.exc = exc
+
+    def simulate(
+        self, ext_input, w_in, 
+        downsample = 1, taus = 35, 
+        tau_min = 20, tau_max = 50, sig_param = None,
+        timescale = 100, dt = 0.05, tref = 2, tm = 10, 
+        vreset = -65, vpeak = -40, tr = 2,
+        stim_mode = None, stim_dur = None, stim_units = None, stim_val = 0.5,
+        input_gain=None, ic=None, output_nodes=None,
+        return_states=True
+    ):
+        """
+        Simulates the dynamics of a spiking neural network given
+        an external input signal 'ext_input', 
+        an input connectivity matrix 'w_in', and
+        synaptic decay time constants 'taus'
+
+        Parameters
+        ----------
+        ext_input : (time, N_inputs) numpy.ndarray
+            External input signal
+            N_inputs: number of external input signals
+        w_in : (N_inputs, N) numpy.ndarray
+            Input connectivity matrix (source, target)
+            N_inputs: number of external input signals
+            N: number of nodes in the network
+        taus : float or (2,) array_like, optional
+            Parameter(s) that modify the decay time constants of the
+            synaptic filter model. 
+            If float, then the same decay time constant is used 
+            for all neurons.
+            If array_like, then:
+            taus[0]: minimum
+            taus[1]: maximum
+        downsample : int, optional
+            Downsamples external input signal by a factor of 'downsample'.
+            Default: 1
+        taus : float or (N,) numpy.ndarray, optional
+            Decay time constants of the synaptic filter model (in ms). 
+            If float, then the same decay time constant tau
+            is used for all neurons.
+            If numpy.ndarray of shape (N,), then:
+            taus[i]: decay time constant of neuron i
+            N: number of nodes in the network
+            Default: 35
+        tau_min : float, optional
+            Minimum decay time constant of the synaptic filter model (in ms).
+            Default: 20
+            Note: used in combination with tau_max and sig_param; 
+            overrides taus
+        tau_max : float, optional
+            Maximum decay time constant of the synaptic filter model (in ms).
+            Default: 50
+            Note: used in combination with tau_min and sig_param;
+            overrides taus
+        sig_param : float, (N,) numpy.ndarray, or string, optional
+            Parameter(s) of the sigmoid function that constrains 
+            the decay time constants of the synaptic filter model.
+            If float, then the same parameter is used for all neurons
+            yielding a single decay time constant for all neurons.
+            If numpy.ndarray of shape (N,), then:
+            sig_param[i]: parameter of the sigmoid function of neuron i
+            and a different decay time constant is used for each neuron.
+            If 'normal', then N values are sampled from a normal distribution
+            with mean = 0 and standard deviation = 1.
+            N: number of nodes in the network.
+            Default: None
+            Note: used in combination with tau_min and tau_max;
+            overrides taus
+        dt : float, optional
+            Sampling rate (in ms). Default: 0.05
+        timescale : float, optional
+            number of internal time steps per external time steps
+            Default: 100
+        tref : float, optional
+            Refractory time constant (in ms). Default: 2
+        tm : float, optional
+            Membrane time constant (in ms). Default: 10
+        vreset : float, optional
+            Reset voltage (in mV). Default: -65
+        vpeak : float, optional
+            Peak voltage (in mV). Default: -40
+        tr : float, optional
+            Rise time constant (in ms). Default: 2
+        stim_mode : {'exc', 'inh'}, optional
+            Indicates whether to apply artificial 
+            depolarizing ('exc') or hyperpolarizing ('inh')
+            stimulation (modelling optogenetic stimulation). 
+            Default: None
+        stim_dur : (2,) numpy.ndarray, optional
+            Time interval (in timesteps) during which 
+            artificial stimulation or inhibition is applied.
+            stim_dur[0]: stimulus onset
+            stim_dur[1]: stimulus offset
+            Default: None
+        stim_units : (N,) numpy.ndarray, optional
+            Indices of neurons that will be stimulated or inhibited.
+            Default: None
+        stim_val : float, optional
+            Value of the artificial stimulation or inhibition (in mV).
+            Default: 0.5
+        input_gain : float, optional
+            Constant gain that scales w_in. Default: None
+        ic : (N,) numpy.ndarray, optional
+            Initial voltage conditions
+            N: number of nodes in the network.
+            Default: None
+        output_nodes : array_like, optional
+            List of nodes for which reservoir states will be returned if
+            'return_states' is True. Default: None
+        return_states : bool, optional
+            If True, simulated reservoir states are returned.
+            Default: True
+
+        Returns
+        -------
+        self._state : (time, N) numpy.ndarray
+            Activation states of the reservoir.
+            N: number of nodes in the network if output_nodes is None, else
+            number of output_nodes
+        """
+
+        # inhibitory and excitatory neuron indices
+        inh_ind = np.where(self.inh)[0]
+        exc_ind = np.where(self.exc)[0]
+
+        # if ext_input is list or tuple convert to numpy.ndarray
+        if isinstance(ext_input, (list, tuple)):
+            sections = utils.get_sections(ext_input)
+            ext_input = utils.concat(ext_input)
+            convert_to_list = True
+        else:
+            convert_to_list = False
+
+        # scale input connectivity matrix
+        if input_gain is not None:
+            w_in = input_gain * w_in
+        w_in = w_in.T
+
+        # Downsample input stimulus
+        ext_input = ext_input.T
+        ext_input = ext_input[:, ::downsample]
+        ext_stim = np.dot(w_in, ext_input)
+        
+        # Set simulation parameters
+        # sampling rate (s)
+        dt = dt/1000 * downsample
+        # trial duration (s)
+        T = (ext_input.shape[1]) * dt * timescale
+        # number of time steps
+        nt = int(np.round(T / dt))
+        # refractory time constant (s)
+        tref = tref/1000
+        # membrane time constant (s)
+        tm = tm/1000
+        # rise time constant (s)
+        tr = tr/1000
+
+        # Synaptic decay time constants (in sec) 
+        # for the synaptic filter
+        # td: decay time constants
+        if sig_param is not None:
+            if sig_param == 'normal':
+                sig_param = np.random.randn(self.n_nodes)
+            td = (1 / (1 + np.exp(-sig_param)) * (tau_max - tau_min) 
+                  + tau_min) / 1000
+        else:
+            td = taus/1000
+
+        # Initialize variables for LIF neurons simulation
+        # post synaptic current
+        IPSC = np.zeros(self.n_nodes)
+        # filtered firing rates (synaptic input accumulation)
+        h = np.zeros(self.n_nodes)
+        # filtered firing rates
+        r = np.zeros(self.n_nodes)
+        # filtered firing rates (rising phase)
+        hr = np.zeros(self.n_nodes)
+        # contribution of each neuron to IPSC
+        JD = np.zeros(self.n_nodes)
+        # number of spikes
+        ns = 0
+        
+        # Initialize voltage
+        if ic is not None:
+            v = ic
+        else:
+            v = vreset + np.random.rand(self.n_nodes) * (30 - vreset)
+        
+        # Initialize storage arrays for recording results
+        # membrane voltage tracings (mV)
+        REC = np.zeros((nt, self.n_nodes))
+        # external input current
+        Is = np.zeros((self.n_nodes, nt))
+        # post synaptic currents over time
+        IPSCs = np.zeros((self.n_nodes, nt))
+        # spike raster
+        spk = np.zeros((self.n_nodes, nt))
+        # filtered firing rates over time
+        rs = np.zeros((self.n_nodes, nt))
+        # filtered firing rates over time (synaptic input accumulation)
+        hs = np.zeros((self.n_nodes, nt))
+        
+        tlast = np.zeros(self.n_nodes) # last spike time
+        
+        BIAS = vpeak # bias current
+
+        # Start the simulation loop
+        for i in range(nt):
+            # Record IPSC over time
+            IPSCs[:, i] = IPSC
+            
+            # Calculate synaptic current
+            I = IPSC + BIAS
+            I = I + ext_stim[:, i // timescale]
+            Is[:, i] = ext_stim[:, i // timescale]
+            
+            # Compute voltage change according to LIF equation
+            dv = (dt * i > tlast + tref) * (-v + I) / tm
+            v = v + dt * dv + np.random.randn(self.n_nodes) / 10
+            
+            # Apply artificial stimulation/inhibition
+            if stim_mode == 'exc':
+                if stim_dur is None:
+                    raise ValueError('stim_dur not specified')
+                elif stim_dur[0] <= i < stim_dur[1]:
+                    if stim_units is None:
+                        raise ValueError('stim_units not specified')
+                    elif np.random.rand() < 0.5:
+                        v[stim_units] = v[stim_units] + stim_val
+            elif stim_mode == 'inh':
+                if stim_dur is None:
+                    raise ValueError('stim_dur not specified')
+                elif stim_dur[0] <= i < stim_dur[1]:
+                    if stim_units is None:
+                        raise ValueError('stim_units not specified')
+                    elif np.random.rand() < 0.5:
+                        v[stim_units] = v[stim_units] - stim_val
+            
+            # Indices of neurons that have fired
+            index = np.where(v >= vpeak)[0]
+            
+            # Store spike times and compute weighted contributions to IPSC
+            if len(index) > 0:
+                JD = np.sum(self.w[:, index], axis=1)
+                curr_ts = np.column_stack((index, np.zeros(len(index)) + dt * i))
+                if ns == 0:
+                    tspike = curr_ts
+                else:
+                    tspike = np.append(tspike, curr_ts, axis=0)
+                ns = ns + len(index)
+            
+            # Set refractory period
+            tlast = tlast + (dt * i - tlast) * (v >= vpeak)
+            
+            # Compute IPSC and filtered firing rates
+            # If the rise time is 0, then use the single synaptic filter,
+            # otherwise (i.e. if the rise time is positive) 
+            # use the double-exponential filter
+            if tr == 0:
+                IPSC = IPSC * np.exp(-dt / td) + JD * (len(index) > 0) / td
+                r = r * np.exp(-dt / td) + (v >= vpeak) / td
+                rs[:, i] = r
+            else:
+                IPSC = IPSC * np.exp(-dt / td) + h * dt
+                h = h * np.exp(-dt / tr) + JD * (len(index) > 0) / (tr * td)
+                hs[:, i] = h
+                
+                r = r * np.exp(-dt / td) + hr * dt
+                hr = hr * np.exp(-dt / tr) + (v >= vpeak) / (tr * td)
+                rs[:, i] = r
+            
+            # Record spikes
+            spk[:, i] = v >= vpeak
+
+            # Cap depolarization
+            v = v + (30 - v) * (v >= vpeak)
+
+            # Record membrane voltage
+            REC[i, :] = v
+            
+            # Reset voltage after spike
+            v = v + (vreset - v) * (v >= vpeak)
+        
+        # Compute average firing rates for different populations
+        inh_fr = np.zeros(len(inh_ind))
+        for i in range(len(inh_ind)):
+            inh_fr[i] = np.sum(spk[inh_ind[i], :] > 0) / T
+        
+        exc_fr = np.zeros(len(exc_ind))
+        for i in range(len(exc_ind)):
+            exc_fr[i] = np.sum(spk[exc_ind[i], :] > 0) / T
+        
+        all_fr = np.zeros(self.n_nodes)
+        for i in range(self.n_nodes):
+            all_fr[i] = np.sum(spk[i, 10:] > 0) / T
+
+        # Average over every 'timescale' time steps
+        rs = rs.reshape(rs.shape[0], int(rs.shape[1]/timescale), timescale).mean(axis = -1)
+        self._state = rs.T
+
+        # Convert back to list or tuple
+        if convert_to_list:
+            self._state = utils.split(self._state, sections)
+
+        self.dt = dt
+        self.T = T
+        self.nt = nt
+        self.td = td
+        self.REC = REC
+        self.Is = Is
+        self.IPSCs = IPSCs
+        self.spk = spk
+        self.rs = rs
+        self.hs = hs
+        self.tspike = tspike
+        self.inh_fr = inh_fr
+        self.exc_fr = exc_fr
+        self.all_fr = all_fr
+
+        # Return the same type
+        if return_states:
+            if output_nodes is not None:
+                if convert_to_list:
+                    return [state[:, output_nodes] for state in self._state]
+                else:
+                    return self._state[:, output_nodes]
+            else:
+                return self._state
 
 class MemristiveReservoir:
     """
@@ -481,7 +999,7 @@ class MemristiveReservoir:
             else:
                 V[i, j] = nv_dict[j] - nv_dict[i]
 
-        return mask(self, V)
+        return self.mask(self, V)
 
     def simulate(self, Vext, ic=None, mode='forward'):
         """
@@ -801,8 +1319,8 @@ class MSSNetwork(MemristiveReservoir):
         # use random number generator for reproducibility
         rng = np.random.default_rng(seed=seed)
 
-        Gab = rng.binomial(Na.astype(int), mask(self, Pa))
-        Gba = rng.binomial(Nb.astype(int), mask(self, Pb))
+        Gab = rng.binomial(Na.astype(int), self.mask(self, Pa))
+        Gba = rng.binomial(Nb.astype(int), self.mask(self, Pb))
 
         if utils.check_symmetric(self._W):
             Gab = utils.make_symmetric(Gab)
