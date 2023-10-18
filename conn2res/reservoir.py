@@ -133,7 +133,7 @@ class EchoStateNetwork(Reservoir):
 
     def simulate(
         self, ext_input, w_in, input_gain=None, ic=None, output_nodes=None,
-        return_states=True, compute_LE = False, **kwargs
+        return_states=True, compute_LE = False, warmup = 0, **kwargs
     ):
         """
         Simulates reservoir dynamics given an external input signal
@@ -194,7 +194,6 @@ class EchoStateNetwork(Reservoir):
             w_in = input_gain * w_in
 
         if compute_LE and self.activation_function_derivative is not None:
-            warmup = kwargs.get('warmup', 10)
             Q = np.eye(self.n_nodes)
             y = np.zeros(self.n_nodes)
             self.LE_trajectory = np.zeros((len(timesteps), self.n_nodes))
@@ -208,10 +207,10 @@ class EchoStateNetwork(Reservoir):
             self._state[t, :] = self.activation_function(synap_input, **kwargs)
 
             if compute_LE and self.activation_function_derivative is not None:
-                J = np.dot(self.w, np.diag(self.activation_function_derivative(synap_input)))
+                J = np.dot(np.diag(self.activation_function_derivative(synap_input)), self.w)
                 Q = np.dot(J, Q)
                 Q, R = np.linalg.qr(Q)
-                yt = np.log(np.abs(np.diag(R)))
+                yt = np.log2(np.abs(np.diag(R)))
                 self.LE_trajectory[t-1, :] = yt
                 if t > warmup:
                     y += yt
@@ -286,7 +285,7 @@ class EchoStateNetwork(Reservoir):
 
         def linear_derivative(x, **kwargs):
             m = kwargs.get('m', 1)
-            return m
+            return np.ones(x.shape) * m
 
         def elu_derivative(x, **kwargs):
             alpha = kwargs.get('alpha', 0.5)
