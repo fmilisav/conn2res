@@ -770,14 +770,14 @@ def plot_spike_raster(tspike, x1, x2, title = "Spike Raster"):
         spike_train = spike_times[neuron]
         plt.scatter(spike_train, [neuron] * len(spike_train), marker='|', color='black')
 
-    plt.xlim(x1, x2)
+    plt.xlim(x1*1000, x2*1000)
     plt.ylim(-0.5, nneurons - 0.5)
     plt.gca().invert_yaxis()
     plt.grid(True, linestyle='--', alpha = 0.7)
     plt.show()
 
 def plot_membrane_voltages(membrane_voltages, x1, x2, neuron_idx = None, 
-                                dt = 0.05, title="Membrane Voltages"):
+                           dt = 0.05, title="Membrane Voltages"):
     """
     Plot the membrane voltages of the neurons.
     
@@ -819,5 +819,4 @@ def plot_membrane_voltages(membrane_voltages, x1, x2, neuron_idx = None,
     fig.supylabel('Voltage (mV)', x = -0.03)
     fig.supxlabel('Time (ms)', y = -0.03)
     fig.tight_layout()
-
     plt.show()

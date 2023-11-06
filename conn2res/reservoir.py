@@ -345,6 +345,10 @@ class SpikingNeuralNetwork(Reservoir):
         boolean array indicating whether a node is
         excitatory (True) or inhibitory (False)
         N: number of nodes in the network
+    som : (N,) numpy.ndarray
+        boolean array indicating whether a node is 
+        somatostatin-expressing (True) or not (False)
+        N: number of nodes in the network
     dt : float
         sampling rate (in s)
     T : float
@@ -401,7 +405,7 @@ class SpikingNeuralNetwork(Reservoir):
 
     """
 
-    def __init__(self, *args, inh = 0.2, **kwargs):
+    def __init__(self, *args, inh = 0.2, som = 0., apply_Dale = True, **kwargs):
         """
         Constructor class for Spiking Neural Networks
 
@@ -416,14 +420,40 @@ class SpikingNeuralNetwork(Reservoir):
             indicates the proportion of inhibitory neurons in the network.
             If numpy.ndarray of shape (N,), then inh is a
             boolean array indicating whether a node is 
-            inhibitory (True) or excitatory (False)
+            inhibitory (True) or excitatory (False).
+            This parameter is used to apply Dale's principle, constraining
+            the connectivity matrix such that a neuron can only be either
+            excitatory or inhibitory, but not both.
             Default: 0.2
+        som: float or (N,) numpy.ndarray, optional
+            If float, som inh should be in the range [0, 1] and
+            indicates the proportion of somatostatin-expressing interneurons 
+            in the network.
+            If numpy.ndarray of shape (N,), then som is a
+            boolean array indicating whether a node is
+            somatostatin-expressing (True) or not (False).
+            Importantly, somatostatin-expressing interneurons are a
+            subset of the inhibitory neurons.
+            This parameter is used to constrain a 
+            common cortical microcircuit motif where somatostatin-expressing
+            inhibitory neurons do not receive inhibitory input.
+            Default: 0
         """
 
         super().__init__(*args, **kwargs)
 
         if not(isinstance(inh, (float, np.ndarray))):
             raise TypeError('inh must be float or numpy.ndarray')
+
+        if not(isinstance(som, (float, np.ndarray))):
+            raise TypeError('som must be float or numpy.ndarray')
+
+        if isinstance(inh, float) and isinstance(som, np.ndarray):
+            raise TypeError('inh must be numpy.ndarray if som is numpy.ndarray')
+
+        if isinstance(inh, np.ndarray) and isinstance(som, np.ndarray):
+            if not np.all(som <= inh):
+                raise ValueError('som must be a subset of inh')
 
         if isinstance(inh, np.ndarray):
             if not np.issubdtype(inh.dtype, np.bool_):
@@ -435,8 +465,41 @@ class SpikingNeuralNetwork(Reservoir):
             inh = np.random.rand(self.n_nodes) < inh
             exc = ~inh
 
+        if isinstance(som, np.ndarray):
+            if not np.issubdtype(som.dtype, np.bool_):
+                raise TypeError('som must be boolean')
+            som_idx = np.where(som)[0]
+        else:
+            if not (0 <= som <= 1):
+                raise ValueError('inh and exc must be in the range [0, 1]')
+            if som > 0:
+                som_size = int(np.round(som * np.sum(inh)))
+                som = np.zeros(self.n_nodes, dtype=bool)
+                som_idx = np.random.choice(np.where(inh)[0], som_size, replace=False)
+                som[som_idx] = True
+            else:
+                som = np.zeros(self.n_nodes, dtype=bool)
+        
+        # apply Dale's principle if inhibitory neurons are specified
+        if np.any(inh):
+            w = np.abs(self.w)
+        
+            # mask matrix imposing Dale's principle
+            mask = np.eye(self.n_nodes, dtype=np.float32)
+            mask[np.where(inh)[0], np.where(inh)[0]] = -1
+
+            # mask matrix imposing wiring motif mediated by
+            # somatostatin-expressing interneurons
+            som_mask = np.ones((self.n_nodes, self.n_nodes), dtype=np.float32)
+            if np.any(som):
+                for i in som_idx:
+                    som_mask[i, np.where(inh)[0]] = 0
+            
+            self.w = np.multiply(np.matmul(w, mask), som_mask)
+
         self.inh = inh
         self.exc = exc
+        self.som = som
 
     def simulate(
         self, ext_input, w_in, 
