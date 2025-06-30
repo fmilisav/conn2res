@@ -258,7 +258,8 @@ def plot_iodata(
 def plot_reservoir_states(
     x, reservoir_states, n_trials=7, palette=None,
     rc_params={}, fig_params={}, ax_params=[{}] * 2, lg_params={},
-    title=None, show=True, savefig=False, fname='res_states', **kwargs
+    title=None, show=True, savefig=False, fname='res_states', 
+    rescale=False, **kwargs
 ):
     """
     Plot simulated reservoir states.
@@ -289,6 +290,8 @@ def plot_reservoir_states(
         _description_, by default False
     fname : _type_, optional
         _description_, by default 'res_states'
+    rescale : bool, optional
+        Whether to rescale the reservoir states, by default False
     """
     # get end points for trials to plot trial separators
     if isinstance(reservoir_states, list):
@@ -332,14 +335,15 @@ def plot_reservoir_states(
 
     # plot inputs (x) and reservoir states
     sns.lineplot(
-        data=x, palette=palette, dashes=False, legend=False, ax=axs[0],
+        data=x, palette=None, dashes=False, legend=False, ax=axs[0],
         **kwargs
     )
 
-    palette = sns.color_palette("tab10", reservoir_states.shape[1])
-    reservoir_states = transform_data(
-        transform_data(reservoir_states, scaler='scale', with_std=False),
-        scaler='minmax_scale', feature_range=(-1, 1))
+    #palette = sns.color_palette(palette, reservoir_states.shape[1])
+    if rescale:
+        reservoir_states = transform_data(
+            transform_data(reservoir_states, scaler='scale', with_std=False),
+            scaler='minmax_scale', feature_range=(-1, 1))
     sns.lineplot(
         data=reservoir_states, palette=palette, dashes=False, legend=False,
         linewidth=0.5, ax=axs[1], **kwargs

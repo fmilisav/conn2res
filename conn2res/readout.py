@@ -267,7 +267,13 @@ class Readout:
                 x_test, y_test, sample_weight_test, metric=metric, **kwargs
             )
 
-            df_scores = pd.DataFrame(data=score, index=[0])
+            #match length of score to length of index
+            if isinstance(list(score.values())[0], np.float):
+                index = [0]
+            else:
+                score_len = len(list(score.values())[0])
+                index = list(range(score_len))
+            df_scores = pd.DataFrame(data=score, index=index)
 
         elif isinstance(readout_nodes, (list, tuple, np.ndarray)):
 
@@ -296,12 +302,18 @@ class Readout:
                         sample_weight_test, metric=metric, **kwargs
                     )
 
-                    df = pd.DataFrame(data=score, index=[0])
+                    #match length of score to length of index
+                    if isinstance(list(score.values())[0], np.float):
+                        index = [0]
+                    else:
+                        score_len = len(list(score.values())[0])
+                        index = list(range(score_len))
+                    df = pd.DataFrame(data=score, index=index)
                     df['module'] = i
                     df['n_nodes'] = len(readouts)
                     df_scores.append(df)
 
-                df_scores = pd.concat(df_scores)
+                df_scores = pd.concat(df_scores, ignore_index=True)
 
             # readout_nodes is a single array
             else:
@@ -315,7 +327,13 @@ class Readout:
                     sample_weight_test, metric=metric, **kwargs
                 )
 
-                df_scores = pd.DataFrame(data=score, index=[0])
+                #match length of score to length of index
+                if isinstance(list(score.values())[0], np.float):
+                    index = [0]
+                else:
+                    score_len = len(list(score.values())[0])
+                    index = list(range(score_len))
+                df_scores = pd.DataFrame(data=score, index=index)
 
         return df_scores
 
@@ -386,7 +404,7 @@ def regressor(*args, **kwargs):
     _type_
         _description_
     """
-    return linear_model.Ridge(alpha=0.5, fit_intercept=False, *args, **kwargs)
+    return linear_model.Ridge(alpha=0.0, fit_intercept=False, *args, **kwargs)
 
 
 def classifier(*args, **kwargs):
@@ -537,7 +555,7 @@ def _check_y_dims(y):
     return y.squeeze()
 
 
-def _get_sample_weight(y, split_set=None):
+def _get_sample_weight(y, split_set=None, **kwargs):
     """
     _summary_
 
@@ -563,19 +581,19 @@ def _get_sample_weight(y, split_set=None):
     sample_weight_train, sample_weight_test = None, None
 
     if split_set == 'train':
-        sample_weight_train = _sample_weight(y_train, split_set)
+        sample_weight_train = _sample_weight(y_train, split_set, **kwargs)
 
     elif split_set == 'test':
-        sample_weight_test = _sample_weight(y_test, split_set)
+        sample_weight_test = _sample_weight(y_test, split_set, **kwargs)
 
     elif split_set == 'both':
-        sample_weight_train = _sample_weight(y_train, split_set)
-        sample_weight_test = _sample_weight(y_test, split_set)
+        sample_weight_train = _sample_weight(y_train, split_set, **kwargs)
+        sample_weight_test = _sample_weight(y_test, split_set, **kwargs)
 
     return sample_weight_train, sample_weight_test
 
 
-def _sample_weight(y, split_set, seed=None):
+def _sample_weight(y, split_set, seed=None, grace_period=0):
     """
     _summary_
 
@@ -588,6 +606,9 @@ def _sample_weight(y, split_set, seed=None):
     seed : int, array_like[ints], SeedSequence, BitGenerator, Generator, optional
         seed to initialize the random number generator, by default None
         for details, see numpy.random.default_rng()
+    grace_period : int
+            Number of samples to zero out at the beginning of each non-zero period,
+            by default 0
 
     Returns
     -------
@@ -616,9 +637,13 @@ def _sample_weight(y, split_set, seed=None):
     sample_weight = np.ones_like(y).astype(float)
     if baseline_type == 'class1':
         sample_weight[y == baseline] = 0
+        if grace_period > 0:
+            sample_weight = apply_grace_period(sample_weight, grace_period)
 
     elif baseline_type == 'class2':
         sample_weight[y == baseline] = 0
+        if grace_period > 0:
+            sample_weight = apply_grace_period(sample_weight, grace_period)
 
         # split sample weight in trials
         sample_weight = utils.split(sample_weight, sections)
@@ -640,10 +665,10 @@ def _sample_weight(y, split_set, seed=None):
 
     if split_set == 'train':
         print('-----------------------------------')
-        
+
         # use random number generator for reproducibility
         rng = np.random.default_rng(seed=seed)
-        
+
         idx = np.where(sample_weight == 0)[0]
         sample_weight[idx] = rng.rand((len(idx)))
 
@@ -652,6 +677,56 @@ def _sample_weight(y, split_set, seed=None):
 
     return sample_weight
 
+
+def apply_grace_period(sample_weight, grace_period):
+        """
+        Applies the grace period to a single array of sample weights
+        
+        Parameters
+        ----------
+        sample_weight : np.ndarray
+            Array of sample weights
+        grace_period : int
+            Number of samples to zero out at the beginning of each non-zero period
+
+        Returns
+        -------
+        zeroed_weights : np.ndarray
+            Sample weights with grace period applied
+        """
+
+        zeroed_weights = sample_weight.copy()
+        in_period = False
+        period_start = None
+
+        for i, w in enumerate(sample_weight):
+            if w > 0 and not in_period:
+                # Start of a new non-zero period
+                in_period = True
+                period_start = i
+            elif w == 0 and in_period:
+                # End of a non-zero period
+                in_period = False
+                # Limit grace period to the size of the non-zero period - 1 (retain at least one point)
+                period_length = i - period_start
+                eff_grace_period = min(grace_period, period_length - 1)
+                if eff_grace_period < grace_period:
+                    warnings.warn("Grace period is larger than the non-zero period. \
+                                   A single time point will be retained.")
+                zeroed_weights[period_start:period_start + eff_grace_period] = 0
+
+        # Handle case where the last non-zero period extends to the end of weights
+        if in_period:
+            # Limit grace period to the size of the non-zero period - 1 (retain at least one point)
+            period_length = len(sample_weight) - period_start
+            eff_grace_period = min(grace_period, period_length - 1)
+            #warn if grace period is larger than the non-zero period
+            if eff_grace_period < grace_period:
+                warnings.warn("Grace period is larger than the last non-zero period. \
+                              A single time point will be retained.")
+            zeroed_weights[period_start:period_start + eff_grace_period] = 0
+
+        return zeroed_weights
 
 def _baseline(y):
     """
@@ -683,7 +758,7 @@ def _baseline(y):
         for target in range(n_targets):
             values, counts = np.unique(y[:, target], return_counts=True)
             baseline.extend(values[counts == counts.max()])
-    
+
     if not len(baseline) == n_targets:
         warnings.warn("There is more than one baseline value per target")
 
@@ -746,7 +821,7 @@ def _baseline_class(y):
     baseline_included = False
     if baseline in labels_per_trial:
         baseline_included = True
-    
+
     # determine baseline_type
     if baseline_exists and not baseline_included:
         baseline_type = 'class1'
